@@ -1,0 +1,78 @@
+# Builds the agent image once per supported Postgres major and pushes it to ghcr.
+#
+# This repo is public, so the published packages are public too -- no manual
+# visibility flip needed (that was only a problem while the agent lived in the
+# private hub repo).
+name: agent images
+
+on:
+  push:
+    tags: ["agent-v*"]
+  workflow_dispatch:
+    inputs:
+      majors:
+        description: 'Postgres majors to build, JSON array'
+        default: '["14","15","16","17","18"]'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep this list in sync with the workflow_dispatch default above.
+        pg: ["14", "15", "16", "17", "18"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # linux/arm64 matters: plenty of people run Postgres on a Pi or a Graviton
+      # box, and the agent has to run next to the database.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push pg${{ matrix.pg }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: PG_MAJOR=${{ matrix.pg }}
+          # No `latest` tag on purpose: the tag *is* the Postgres major, and a
+          # `latest` that silently means "18" would restore into the wrong
+          # version and still look green.
+          tags: |
+            ghcr.io/nemanjab17/pgrc-agent:${{ matrix.pg }}
+            ghcr.io/nemanjab17/pgrc-agent:${{ matrix.pg }}-${{ github.sha }}
+          provenance: false
+          cache-from: type=gha,scope=pg${{ matrix.pg }}
+          cache-to: type=gha,mode=max,scope=pg${{ matrix.pg }}
+
+  smoke:
+    # A published image that cannot verify anything is worse than no image.
+    needs: build
+    runs-on: ubuntu-latest
+    services:
+      source:
+        image: postgres:16-alpine
+        env: { POSTGRES_PASSWORD: smoke, POSTGRES_DB: app }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-retries 10
+    steps:
+      - name: One dry run against a throwaway database
+        run: |
+          docker run --rm --network host \
+            -e SOURCE_URL=postgres://postgres:smoke@127.0.0.1:5432/app \
+            -e PGRC_DRY_RUN=1 \
+            ghcr.io/nemanjab17/pgrc-agent:16 | tee out.json
+          grep -q '"status": "pass"' out.json
