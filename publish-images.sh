@@ -10,7 +10,7 @@ set -euo pipefail
 : "${GH_USER:?set GH_USER}" "${GH_TOKEN:?set GH_TOKEN}"
 MAJORS=("${@:-16}")
 IMAGE="ghcr.io/${GH_USER}/pgrc-agent"
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"   # repo root
 
 echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin
 docker buildx inspect pgrc >/dev/null 2>&1 || docker buildx create --name pgrc --use
