@@ -71,8 +71,8 @@ jobs:
           --health-cmd "pg_isready -U postgres" --health-interval 5s
           --health-retries 10
     steps:
-      # A freshly published GHCR package is private even when the repo is
-      # public, so CI logs in rather than assuming an anonymous pull works.
+      # Packages from a public repo are pullable anonymously, but CI logs in
+      # anyway: authenticated pulls do not share the anonymous rate limit.
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
