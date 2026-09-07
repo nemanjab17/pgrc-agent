@@ -1,0 +1,33 @@
+# pgrestore-check agent as a system daemon. It schedules itself from the hub
+# (interval comes from your dashboard), so there is no timer and no cron entry.
+#
+#   sudo cp pgrc-agent.service /etc/systemd/system/
+#   sudo install -d -m 700 /etc/pgrc && sudoedit /etc/pgrc/agent.env
+#   sudo systemctl enable --now pgrc-agent
+#   journalctl -fu pgrc-agent
+#
+# /etc/pgrc/agent.env:
+#   PGRC_HUB=https://pgrestore-check.fly.dev
+#   PGRC_TOKEN=pgrc_...
+#   SOURCE_URL=postgres://user:pass@db.internal:5432/app
+#   PGRC_CHECK_SQL=/etc/pgrc/checks.sql     # optional
+[Unit]
+Description=pgrestore-check agent (verifies that your Postgres backup restores)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+# Use the image tag that matches your server's Postgres major version.
+Environment=PGRC_IMAGE=ghcr.io/nemanjab17/pgrc-agent:16
+ExecStartPre=-/usr/bin/docker rm -f pgrc-agent
+ExecStart=/usr/bin/docker run --rm --name pgrc-agent \
+  --env-file /etc/pgrc/agent.env \
+  -v pgrc-state:/var/lib/pgrc \
+  -v /etc/pgrc:/etc/pgrc:ro \
+  ${PGRC_IMAGE}
+ExecStop=/usr/bin/docker stop -t 60 pgrc-agent   # a verification in progress is left to finish
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

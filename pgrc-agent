@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""pgrestore-check agent — proves a Postgres backup actually restores.
+
+Runs as a **long-lived daemon** inside the customer's own network (systemd unit
+or `docker run -d --restart=always`), so no credentials ever leave it. It asks
+the hub how often to verify and when it last reported, sleeps until the next run
+is due, and never needs a cron entry. `PGRC_ONCE=1` does a single run and exits,
+for testing or for people who insist on their own scheduler.
+
+One verification run:
+
+  1. count rows on the source                     (pre-dump observation)
+  2. pg_dump -Fc the source
+  3. count rows on the source again               (post-dump observation)
+  4. initdb a throwaway cluster *inside this container*, pg_restore into it
+  5. count rows in the restored copy + schema-fidelity checks
+  6. POST the numbers (never the data) to the hub
+
+Live tables move while you dump them, so a restored count is judged against the
+range spanned by the two source observations; a table that did not change during
+the dump is judged on exact equality. That distinction is reported per table.
+
+Env:
+  SOURCE_URL     required  postgres://user:pass@host:5432/db
+  PGRC_HUB       required  https://hub.example.com   (omit with PGRC_DRY_RUN=1)
+  PGRC_TOKEN     required  pgrc_...                  (omit with PGRC_DRY_RUN=1)
+  PGRC_TABLES    default 50    max tables to row-count (biggest first)
+  PGRC_JOBS      default 2     pg_restore parallel jobs
+  PGRC_CHECK_SQL optional      file with one boolean SQL per line, run on the restore
+  PGRC_KEEP      optional      keep the scratch cluster (debugging)
+  PGRC_DRY_RUN   optional      print the report instead of sending it
+  PGRC_ONCE      optional      verify once and exit instead of daemonising
+  PGRC_INTERVAL_H optional     override the interval the hub asks for
+  PGRC_STATE     default /var/lib/pgrc/state.json   last-run marker, so a
+                 restart loop cannot re-dump the source every few seconds
+
+Exit codes: 0 verified and reported · 1 verification failed · 2 the report never
+reached the hub (revoked token, quota, hub down) · 3 misconfigured.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "0.1.0"
+
+SOURCE_URL = os.environ.get("SOURCE_URL", "")
+HUB = os.environ.get("PGRC_HUB", "").rstrip("/")
+TOKEN = os.environ.get("PGRC_TOKEN", "")
+MAX_TABLES = int(os.environ.get("PGRC_TABLES", "50"))
+JOBS = max(1, int(os.environ.get("PGRC_JOBS", "2")))
+CHECK_SQL = os.environ.get("PGRC_CHECK_SQL", "")
+DRY_RUN = os.environ.get("PGRC_DRY_RUN", "") not in ("", "0", "false")
+KEEP = os.environ.get("PGRC_KEEP", "") not in ("", "0", "false")
+ONCE = os.environ.get("PGRC_ONCE", "") not in ("", "0", "false")
+INTERVAL_H = float(os.environ.get("PGRC_INTERVAL_H") or 0)
+STATE_PATH = os.environ.get("PGRC_STATE", "/var/lib/pgrc/state.json")
+
+DEFAULT_INTERVAL_H = 24.0
+POLL_MAX_S = 900          # never sleep longer than this without re-checking the hub
+RETRY_AFTER_NETWORK_S = 600
+
+log_lines: list[str] = []
+# Set by finish(): None, "network" (retry soon) or "http" (the hub answered, so
+# waiting for the next interval is the right move).
+delivery_error: str | None = None
+# An Event, not a bool: time.sleep() is *retried* after a signal (PEP 475), so a
+# flag set by the handler would not be noticed for up to a full sleep slice and
+# `docker stop` would end in SIGKILL. Event.wait() returns immediately on set().
+_stop = threading.Event()
+
+
+# libpq never prints the password, but it does print the host, its resolved IP,
+# the port, the user and the database into stderr -- and stderr ends up in the
+# report we send. The landing page promises none of that leaves the customer's
+# network, so every string in an outgoing report goes through here first.
+_URI_RE = re.compile(r"postgres(?:ql)?://\S+", re.I)
+_CONN_RE = re.compile(r'connection to server (?:at "[^"]*"(?: \([^)]*\))?|on socket "[^"]*")'
+                      r'(?:, port \d+)?', re.I)
+_USER_RE = re.compile(r'\b(for|role|user) "[^"]*"', re.I)
+
+
+def scrub(text: str) -> str:
+    if not text:
+        return text
+    if SOURCE_URL:
+        text = text.replace(SOURCE_URL, "[source]")
+    text = _URI_RE.sub("[source]", text)
+    text = _CONN_RE.sub("connection to server [redacted]", text)
+    return _USER_RE.sub(r'\1 [redacted]', text)
+
+
+def scrub_report(report: dict) -> dict:
+    """Applied to the whole report right before it is sent, so no future call
+    site can forget to do it."""
+    report["error_tail"] = scrub(report.get("error_tail") or "")
+    for c in report.get("checks") or []:
+        if c.get("detail"):
+            c["detail"] = scrub(str(c["detail"]))
+    return report
+
+
+def log(msg: str) -> None:
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    log_lines.append(line)
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def psql(target: list[str], sql: str) -> list[list[str]]:
+    """Run one statement, return rows as lists of strings. Raises on error."""
+    cp = run(["psql", *target, "-X", "-q", "-A", "-t", "-F", "\x1f",
+              "-v", "ON_ERROR_STOP=1", "-c", sql])
+    if cp.returncode != 0:
+        raise RuntimeError(f"psql failed: {cp.stderr.strip()[:400]}")
+    return [ln.split("\x1f") for ln in cp.stdout.splitlines() if ln.strip() != ""]
+
+
+def major(version: str) -> int:
+    """"18beta1" and "17devel" are real answers from SHOW server_version, and
+    int("18beta1") would abort the whole run."""
+    m = re.match(r"\s*(\d+)", version or "")
+    return int(m.group(1)) if m else 0
+
+
+def qident(schema: str, name: str) -> str:
+    return '"%s"."%s"' % (schema.replace('"', '""'), name.replace('"', '""'))
+
+
+TABLE_LIST_SQL = """
+SELECT n.nspname, c.relname, pg_total_relation_size(c.oid)
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r','p') AND c.relispartition = false
+  AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname NOT LIKE 'pg\\_toast%'
+ORDER BY pg_total_relation_size(c.oid) DESC, 1, 2
+LIMIT {limit}
+"""
+
+OBJECT_COUNTS_SQL = """
+SELECT
+  (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+     WHERE c.relkind IN ('r','p') AND n.nspname NOT IN
+       ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg\\_toast%'),
+  (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+     WHERE c.relkind='i' AND n.nspname NOT IN ('pg_catalog','information_schema')),
+  (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+     WHERE c.relkind IN ('v','m') AND n.nspname NOT IN
+       ('pg_catalog','information_schema')),
+  (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+     WHERE c.relkind='S' AND n.nspname NOT IN ('pg_catalog','information_schema')),
+  (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+     WHERE n.nspname NOT IN ('pg_catalog','information_schema')),
+  (SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace
+     WHERE n.nspname NOT IN ('pg_catalog','information_schema'))
+"""
+
+
+def counts(target: list[str], tables: list[tuple[str, str]]) -> dict[str, int]:
+    if not tables:
+        return {}
+    # One round trip for every table would be a round trip per table; batch it.
+    parts = [
+        "SELECT %s AS k, count(*) AS n FROM %s" % (
+            "'" + f"{s}.{t}".replace("'", "''") + "'", qident(s, t))
+        for s, t in tables
+    ]
+    rows = psql(target, " UNION ALL ".join(parts))
+    return {r[0]: int(r[1]) for r in rows if len(r) == 2}
+
+
+def object_counts(target: list[str]) -> dict[str, int]:
+    r = psql(target, OBJECT_COUNTS_SQL)[0]
+    keys = ["tables", "indexes", "views", "sequences", "functions", "constraints"]
+    return dict(zip(keys, (int(x) for x in r)))
+
+
+def verify_once() -> int:
+    src = [SOURCE_URL]
+    log_lines.clear()   # error_tail is per run, not per process lifetime
+    report: dict = {"agent_version": VERSION, "status": "fail", "tables": [],
+                    "checks": [], "timings": {}, "restore_errors": 0}
+    work = tempfile.mkdtemp(prefix="pgrc-", dir=os.environ.get("PGRC_WORKDIR", "/tmp"))
+    started = time.time()
+    try:
+        ver = psql(src, "SHOW server_version")[0][0]
+        report["pg_version"] = ver
+        local = run(["pg_dump", "--version"]).stdout.strip().split()[-1]
+        log(f"source postgres {ver}, local tools {local}")
+        if major(ver) > major(local):
+            report["checks"].append({
+                "name": "tool version", "ok": False,
+                "detail": f"pg_dump {local} is older than the server {ver} — "
+                          f"use the agent image tagged :{major(ver)}"})
+
+        report["source_size_bytes"] = int(
+            psql(src, "SELECT pg_database_size(current_database())")[0][0])
+
+        # The compressed dump *and* a full restored copy both live in the
+        # workdir. Running out of room halfway through a restore looks like a
+        # corrupt backup, which is the one wrong answer this tool must not give.
+        free = shutil.disk_usage(work).free
+        need = int(report["source_size_bytes"] * 1.3)
+        log(f"source {report['source_size_bytes'] / 1e6:.0f} MB, "
+            f"{free / 1e6:.0f} MB free in {work}")
+        if free < need:
+            report["checks"].append({
+                "name": "workspace", "ok": False,
+                "detail": f"need about {need / 1e6:.0f} MB in "
+                          f"{os.path.dirname(work)}, only {free / 1e6:.0f} MB free — "
+                          "mount a bigger volume on PGRC_WORKDIR"})
+            log("not enough disk space to restore into; refusing to guess")
+            return finish(report, started)
+
+        tables = [(r[0], r[1]) for r in psql(src, TABLE_LIST_SQL.replace("{limit}", str(MAX_TABLES)))]
+        log(f"row-counting {len(tables)} of the largest tables")
+        before = counts(src, tables)
+        src_objects = object_counts(src)
+
+        # ---- dump ---------------------------------------------------------
+        dump = os.path.join(work, "dump.pgc")
+        t0 = time.time()
+        cp = run(["pg_dump", "-Fc", "--no-owner", "--no-privileges", "-f", dump, SOURCE_URL])
+        report["timings"]["dump_s"] = round(time.time() - t0, 2)
+        if cp.returncode != 0:
+            log("pg_dump FAILED")
+            log(cp.stderr.strip()[-1500:])
+            report["checks"].append({"name": "pg_dump", "ok": False,
+                                     "detail": cp.stderr.strip()[-300:]})
+            return finish(report, started)
+        report["dump_bytes"] = os.path.getsize(dump)
+        report["checks"].append({
+            "name": "pg_dump", "ok": True,
+            "detail": f"{report['dump_bytes'] / 1e6:.1f} MB in "
+                      f"{report['timings']['dump_s']}s"})
+        log(f"dumped {report['dump_bytes'] / 1e6:.1f} MB")
+
+        after = counts(src, tables)
+
+        # ---- scratch cluster + restore -------------------------------------
+        pgdata = os.path.join(work, "pgdata")
+        sock = os.path.join(work, "sock")
+        os.makedirs(sock, exist_ok=True)
+        cp = run(["initdb", "-D", pgdata, "-U", "postgres", "--auth=trust",
+                  "--no-sync", "-E", "UTF8"])
+        if cp.returncode != 0:
+            raise RuntimeError("initdb failed: " + cp.stderr.strip()[-400:])
+        opts = (f"-c listen_addresses='' -k {sock} -c fsync=off "
+                "-c full_page_writes=off -c synchronous_commit=off "
+                "-c max_wal_size=4GB -c maintenance_work_mem=256MB")
+        cp = run(["pg_ctl", "-D", pgdata, "-o", opts, "-l",
+                  os.path.join(work, "pg.log"), "-w", "-t", "60", "start"])
+        if cp.returncode != 0:
+            raise RuntimeError("scratch postgres would not start: " +
+                               (cp.stderr or cp.stdout).strip()[-400:])
+        tgt = ["-h", sock, "-U", "postgres", "-d", "verify"]
+        try:
+            cp = run(["createdb", "-h", sock, "-U", "postgres", "verify"])
+            if cp.returncode != 0:
+                raise RuntimeError("createdb failed: " + cp.stderr.strip()[-300:])
+
+            # Which server did we actually restore into? It is the version baked
+            # into this image's tag, not necessarily the source's version, and
+            # that distinction decides what the green tick means.
+            tgt_ver = psql(tgt, "SHOW server_version")[0][0]
+            report["restore_pg_version"] = tgt_ver
+            src_major, tgt_major = major(ver), major(tgt_ver)
+            if src_major == tgt_major:
+                detail = f"postgres {tgt_ver}, same major as the source"
+            else:
+                detail = (f"postgres {tgt_ver}, but the source is {ver}: this proves "
+                          f"the dump loads into {tgt_major}, not that it restores "
+                          f"into {src_major} — use the :{src_major} image for that")
+                log("restore target major differs from the source")
+            report["checks"].append({"name": "restore target", "ok": True,
+                                     "detail": detail})
+            log(f"restoring into scratch postgres {tgt_ver}")
+
+            t0 = time.time()
+            cp = run(["pg_restore", "-h", sock, "-U", "postgres", "-d", "verify",
+                      "-j", str(JOBS), "--no-owner", "--no-privileges", dump])
+            report["timings"]["restore_s"] = round(time.time() - t0, 2)
+            errs = [l for l in (cp.stderr or "").splitlines()
+                    if "error:" in l.lower() or "FATAL" in l]
+            report["restore_errors"] = len(errs)
+            report["checks"].append({
+                "name": "pg_restore", "ok": cp.returncode == 0 and not errs,
+                "detail": f"exit {cp.returncode}, {len(errs)} errors, "
+                          f"{report['timings']['restore_s']}s"})
+            for l in errs[:20]:
+                log("restore: " + l.strip()[:200])
+            log(f"restored in {report['timings']['restore_s']}s "
+                f"({len(errs)} errors)")
+
+            # ---- verify ----------------------------------------------------
+            t0 = time.time()
+            restored = counts(tgt, tables)
+            rows = []
+            for s, t in tables:
+                k = f"{s}.{t}"
+                b, a, r = before.get(k), after.get(k), restored.get(k)
+                if b is None or a is None or r is None:
+                    rows.append({"schema": s, "name": t, "source_rows": b,
+                                 "restored_rows": r, "ok": False, "mode": "missing"})
+                    continue
+                lo, hi = min(b, a), max(b, a)
+                rows.append({"schema": s, "name": t,
+                             "source_rows": a, "restored_rows": r,
+                             "ok": lo <= r <= hi,
+                             "mode": "exact" if b == a else f"range {lo}-{hi}"})
+            report["tables"] = rows
+            bad = [r for r in rows if not r["ok"]]
+            log(f"row counts: {len(rows) - len(bad)}/{len(rows)} match")
+
+            tgt_objects = object_counts(tgt)
+            for k, v in src_objects.items():
+                # Indexes/constraints can legitimately differ if the dump was
+                # taken with filters; we dump everything, so they must match.
+                report["checks"].append({
+                    "name": f"{k} present", "ok": tgt_objects.get(k) == v,
+                    "detail": f"source {v}, restored {tgt_objects.get(k)}"})
+            invalid = int(psql(tgt, "SELECT count(*) FROM pg_index "
+                                    "WHERE NOT indisvalid")[0][0])
+            report["checks"].append({"name": "all indexes valid", "ok": invalid == 0,
+                                     "detail": f"{invalid} invalid"})
+
+            if CHECK_SQL and not os.path.exists(CHECK_SQL):
+                # Never skip quietly: a typo'd path would mean the checks the
+                # customer thinks are guarding their restore never ran at all.
+                log(f"PGRC_CHECK_SQL={CHECK_SQL} does not exist")
+                report["checks"].append({"name": "custom checks", "ok": False,
+                                         "detail": f"file not found: {CHECK_SQL}"})
+            elif CHECK_SQL:
+                with open(CHECK_SQL) as f:
+                    # Numbered by check, not by file line: "custom check 4" for
+                    # the first assertion in a commented file is unreadable.
+                    n = 0
+                    for line in f:
+                        q = line.strip()
+                        if not q or q.startswith("--"):
+                            continue
+                        n += 1
+                        try:
+                            out = psql(tgt, q)
+                            ok = bool(out) and out[0][0].strip() in ("t", "true", "1")
+                            got = out[0][0].strip()[:20] if out else "no rows"
+                            report["checks"].append({
+                                "name": f"custom check {n}", "ok": ok,
+                                # The query itself, so a red check is debuggable
+                                # from the dashboard without opening the server.
+                                "detail": f"{q[:120]} -> {got}"})
+                        except RuntimeError as e:
+                            report["checks"].append({"name": f"custom check {n}",
+                                                     "ok": False,
+                                                     "detail": f"{q[:120]} -> {str(e)[:200]}"})
+            report["timings"]["verify_s"] = round(time.time() - t0, 2)
+        finally:
+            run(["pg_ctl", "-D", pgdata, "-m", "immediate", "-w", "-t", "30", "stop"])
+
+        failed = [c for c in report["checks"] if not c["ok"]]
+        report["status"] = ("pass" if not failed and not report["restore_errors"]
+                            and all(r["ok"] for r in report["tables"]) else "fail")
+        return finish(report, started)
+    except Exception as e:  # noqa: BLE001 - the report must always be sent
+        log(f"agent error: {e}")
+        report["checks"].append({"name": "agent run", "ok": False, "detail": str(e)[:300]})
+        report["status"] = "fail"
+        return finish(report, started)
+    finally:
+        if KEEP:
+            log(f"kept scratch dir {work}")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def finish(report: dict, started: float) -> int:
+    report["timings"]["total_s"] = round(time.time() - started, 2)
+    report["error_tail"] = "\n".join(log_lines)[-3500:]
+    log(f"result: {report['status'].upper()} in {report['timings']['total_s']}s")
+    # Before the dry-run branch as well: PGRC_DRY_RUN is how a careful person
+    # checks what we would receive, so it has to show the redacted truth.
+    scrub_report(report)
+
+    if DRY_RUN:
+        print(json.dumps(report, indent=2))
+        return 0 if report["status"] == "pass" else 1
+
+    # The verdict must fit in the hub's body cap, or the run is invisible: a
+    # rejected report leaves the dashboard showing "no reports" while the agent
+    # keeps saying PASS. Shed detail until it fits, never the verdict itself.
+    # Failed checks are kept ahead of passing ones -- they are why you would read
+    # this at all.
+    checks = report.get("checks") or []
+    report["checks"] = ([c for c in checks if not c.get("ok")]
+                        + [c for c in checks if c.get("ok")])[:60]
+    body = json.dumps(report).encode()
+    for shed in (1, 2, 3, 4):
+        if len(body) <= 60000:
+            break
+        if shed == 1:
+            report["tables"] = report["tables"][:50]
+        elif shed == 2:
+            report["error_tail"] = report["error_tail"][-1500:]
+        elif shed == 3:
+            report["checks"] = report["checks"][:20]
+            for c in report["checks"]:
+                c["detail"] = str(c.get("detail") or "")[:200]
+        else:
+            report["tables"] = report["tables"][:10]
+            report["error_tail"] = report["error_tail"][-400:]
+        body = json.dumps(report).encode()
+    req = urllib.request.Request(f"{HUB}/api/v1/reports", data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {TOKEN}",
+                                          "User-Agent": f"pgrc-agent/{VERSION}"})
+    global delivery_error
+    delivery_error = None
+    delivered = False
+    for attempt in (1, 2, 3):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                print("hub:", r.status, r.read(300).decode(errors="replace"))
+            delivered = True
+            break
+        except urllib.error.HTTPError as e:
+            print("hub rejected:", e.code, e.read(300).decode(errors="replace"),
+                  file=sys.stderr)
+            delivery_error = "http"
+            break  # 4xx: a retry will not help
+        except Exception as e:  # network hiccup
+            print(f"hub unreachable ({e}), attempt {attempt}/3", file=sys.stderr)
+            delivery_error = "network"
+            time.sleep(3 * attempt)
+
+    if not delivered:
+        # Exit non-zero even on a passing verification: a revoked token or an
+        # over-quota hub would otherwise leave a permanently green cron job
+        # while nothing at all is being monitored. Exit 2 = "verified fine, but
+        # nobody was told", so cron mail / systemd status shows it.
+        print("report was NOT delivered to the hub", file=sys.stderr)
+        return 2
+    return 0 if report["status"] == "pass" else 1
+
+
+# --------------------------------------------------------------------------- #
+# daemon: ask the hub when the next run is due, sleep, verify, repeat
+# --------------------------------------------------------------------------- #
+
+def read_state() -> float:
+    try:
+        with open(STATE_PATH) as f:
+            return float(json.load(f).get("last_run") or 0)
+    except Exception:
+        return 0.0
+
+
+_state_warned = False
+
+
+def write_state(ts: float) -> None:
+    """Best effort. Without it we fall back to the hub's last_report_at, which is
+    usually the better number anyway — the state file only matters while the hub
+    is unreachable, to stop a restart loop from re-dumping every few seconds."""
+    global _state_warned
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"last_run": int(ts)}, f)
+        os.replace(tmp, STATE_PATH)
+    except Exception as e:
+        if not _state_warned:
+            log(f"cannot write {STATE_PATH} ({e}); scheduling from the hub only")
+            _state_warned = True
+
+
+def hub_config() -> dict | None:
+    req = urllib.request.Request(f"{HUB}/api/v1/config",
+                                 headers={"Authorization": f"Bearer {TOKEN}",
+                                          "User-Agent": f"pgrc-agent/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read(20000))
+    except urllib.error.HTTPError as e:
+        log(f"hub config rejected: {e.code} — check PGRC_TOKEN")
+    except Exception as e:
+        log(f"hub config unreachable ({e})")
+    return None
+
+
+def sleep_until(ts: float) -> None:
+    while not _stop.is_set():
+        left = ts - time.time()
+        if left <= 0:
+            return
+        _stop.wait(min(left, 30))
+
+
+def daemon() -> int:
+    def bye(signum, _frame):
+        _stop.set()
+        log(f"signal {signum}, shutting down")
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+
+    log(f"agent {VERSION} started as a daemon, hub {HUB}")
+    while not _stop.is_set():
+        cfg = hub_config() or {}
+        interval_h = INTERVAL_H or float(cfg.get("interval_h") or DEFAULT_INTERVAL_H)
+        last = max(read_state(), float(cfg.get("last_report_at") or 0))
+        due = last + interval_h * 3600 if last else time.time()
+
+        if time.time() < due:
+            nap = min(due, time.time() + POLL_MAX_S)
+            log(f"next verification due in {(due - time.time()) / 60:.0f} min "
+                f"(every {interval_h:g}h)")
+            sleep_until(nap)
+            continue
+
+        code = verify_once()
+        write_state(time.time())
+        if code == 2 and delivery_error == "network":
+            # The verification itself was fine; only the hub was unreachable.
+            # Try again soon rather than sitting out a whole interval.
+            log(f"retrying in {RETRY_AFTER_NETWORK_S // 60} min (hub unreachable)")
+            sleep_until(time.time() + RETRY_AFTER_NETWORK_S)
+    log("stopped")
+    return 0
+
+
+def main() -> int:
+    if not SOURCE_URL:
+        print("SOURCE_URL is required", file=sys.stderr)
+        return 3
+    if not DRY_RUN and not (HUB and TOKEN):
+        print("PGRC_HUB and PGRC_TOKEN are required (or set PGRC_DRY_RUN=1)",
+              file=sys.stderr)
+        return 3
+    if ONCE or DRY_RUN:
+        return verify_once()
+    return daemon()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
